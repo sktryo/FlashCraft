@@ -1,3 +1,4 @@
+
 import json
 import os
 import sys
@@ -5,13 +6,14 @@ import urllib.request
 import argparse
 import platform
 import shutil
+import time
 
 MANIFEST_URL = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
 FABRIC_META_URL = "https://meta.fabricmc.net/v2/versions/loader"
 
 def download(url, path, quiet=False):
     if os.path.exists(path):
-        return
+        return False # File already exists, no download needed
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if not quiet:
         print(f"Downloading: {os.path.basename(path)}")
@@ -19,17 +21,92 @@ def download(url, path, quiet=False):
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req) as response, open(path, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
+        return True # Download successful
     except Exception as e:
         if not quiet:
             print(f"  Error downloading {url}: {e}")
+        return False # Download failed
 
 def get_json(url):
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req) as response:
         return json.loads(response.read().decode())
 
-def setup_minecraft(version_id, username, ram, skip_assets, use_fabric):
-    print(f"--- FlashCraft v1.3.0: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
+def create_main_runner_script():
+    """Generates the main run.sh script that manages config launchers."""
+    main_runner_content = """#!/bin/bash
+
+FLASHCRAFT_CONFIGS_DIR=".flashcraft/configs"
+
+if [ ! -d "$FLASHCRAFT_CONFIGS_DIR" ]; then
+    echo "Error: Configuration directory '$FLASHCRAFT_CONFIGS_DIR' not found."
+    echo "Please run 'python3 setup_mc.py' to create configurations."
+    exit 1
+fi
+
+configs=()
+for file in "$FLASHCRAFT_CONFIGS_DIR"/*.sh; do
+    if [ -e "$file" ]; then
+        configs+=("$file")
+    fi
+done
+
+num_configs=${#configs[@]}
+
+if [ "$num_configs" -eq 0 ]; then
+    echo "Error: No configurations found in '$FLASHCRAFT_CONFIGS_DIR'."
+    echo "Please run 'python3 setup_mc.py' to create configurations."
+    exit 1
+fi
+
+if [ "$#" -eq 1 ]; then
+    # Argument provided, try to launch directly
+    target_config_path=""
+    for config_path in "${configs[@]}"; do
+        config_name=$(basename "$config_path" .sh)
+        if [ "$config_name" == "$1" ]; then
+            target_config_path="$config_path"
+            break
+        fi
+    done
+
+    if [ -n "$target_config_path" ]; then
+        echo "Launching '$1'..."
+        exec "$target_config_path"
+    else
+        echo "Error: Configuration '$1' not found."
+        echo "Available configurations:"
+        for config_path in "${configs[@]}"; do
+            echo "  - $(basename "$config_path" .sh)"
+        done
+        exit 1
+    fi
+else
+    # No argument or too many arguments, show menu
+    echo "Available Minecraft configurations:"
+    for i in "${!configs[@]}"; do
+        config_name=$(basename "${configs[$i]}" .sh)
+        echo "$((i+1))) $config_name"
+    done
+
+    read -p "Enter number to launch: " choice
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$num_configs" ]; then
+        selected_config="${configs[$((choice-1))]}"
+        echo "Launching '$(basename "$selected_config" .sh)'..."
+        exec "$selected_config"
+    else
+        echo "Invalid choice. Exiting."
+        exit 1
+    fi
+fi
+"""
+    with open("run.sh", "w") as f:
+        f.write(main_runner_content)
+    os.chmod("run.sh", 0o755)
+
+def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_name):
+    print(f"--- FlashCraft v1.6.0: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
     
     # 1. Minecraft Version Data
     print("Fetching Minecraft version manifest...")
@@ -48,7 +125,8 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric):
         if not loaders:
             print(f"Error: Fabric not available for {version_id}.")
             return
-        loader_version = loaders[0]["loader"]["version"]
+        # Use latest stable loader version
+        loader_version = next((l["loader"]["version"] for l in loaders if not l["loader"]["stable"]), loaders[0]["loader"]["version"])
         fabric_data = get_json(f"{FABRIC_META_URL}/{version_id}/{loader_version}/profile/json")
 
     # 3. Base JAR and Libraries
@@ -76,11 +154,14 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric):
                     if action == "allow": allow = True
         if not allow: continue
 
-        if "downloads" in lib and "artifact" in lib["downloads"]:
-            art = lib["downloads"]["artifact"]
-            path = os.path.join(lib_base, art["path"])
-            download(art["url"], path)
+        lib_path = None
+        if "downloads" in lib:
+            if "artifact" in lib["downloads"]:
+                art = lib["downloads"]["artifact"]
+                lib_path = os.path.join(lib_base, art["path"])
+                download(art["url"], lib_path)
             
+            # ARM64 LWJGL
             if is_arm and "org.lwjgl" in lib["name"] and "natives-linux" in lib["name"]:
                 v = lib["name"].split(":")[-2]
                 n = lib["name"].split(":")[1]
@@ -88,8 +169,10 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric):
                 arm_url = f"https://repo1.maven.org/maven2/org/lwjgl/{n}/{v}/{arm_art}"
                 arm_path = os.path.join(lib_base, "org/lwjgl", n, v, arm_art)
                 download(arm_url, arm_path)
-                if os.path.exists(arm_path): path = arm_path
-            cp_parts.append(os.path.abspath(path))
+                if os.path.exists(arm_path): lib_path = arm_path
+        
+        if lib_path:
+            cp_parts.append(os.path.abspath(lib_path))
 
     # --- Process Fabric Libraries ---
     main_class = mc_v_data['mainClass']
@@ -98,33 +181,91 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric):
         main_class = fabric_data["mainClass"]
         for lib in fabric_data["libraries"]:
             name_parts = lib["name"].split(":")
-            group = name_parts[0].replace(".", "/")
-            name = name_parts[1]
+            group_path = name_parts[0].replace(".", "/")
+            artifact_name = name_parts[1]
             version = name_parts[2]
-            path = os.path.join(lib_base, group, name, version, f"{name}-{version}.jar")
-            download(lib["url"] + f"{group}/{name}/{version}/{name}-{version}.jar", path)
-            cp_parts.append(os.path.abspath(path))
+            
+            local_path = os.path.join(lib_base, group_path, artifact_name, version, f"{artifact_name}-{version}.jar")
+            download(lib["url"], local_path)
+            cp_parts.append(os.path.abspath(local_path))
 
     # 4. Assets
     asset_info = mc_v_data["assetIndex"]
     asset_id = asset_info['id']
     download(asset_info["url"], f"assets/indexes/{asset_id}.json")
+
+    # --- Asset Download Progress ---
     if not skip_assets:
-        print("Checking assets...")
+        print("Calculating asset download requirements...")
         with open(f"assets/indexes/{asset_id}.json", "r") as f:
             assets = json.load(f)
         objects = assets["objects"]
-        count = 0
+        
+        assets_to_download = []
+        total_bytes_to_download = 0
         for name, info in objects.items():
             h = info["hash"]
             p = os.path.join("assets", "objects", h[:2], h)
             if not os.path.exists(p):
-                download(f"https://resources.download.minecraft.net/{h[:2]}/{h}", p, quiet=True)
-            count += 1
-            if count % 2000 == 0: print(f" Progress: {count}/{len(objects)}")
+                assets_to_download.append({'hash': h, 'path': p, 'size': info['size']})
+                total_bytes_to_download += info['size']
+        
+        num_assets_to_download = len(assets_to_download)
+        total_assets = len(objects)
 
-    # 5. Generate Launch Script
-    print("Generating run.sh...")
+        print(f"Downloading {num_assets_to_download} of {total_assets} assets ({total_bytes_to_download / (1024*1024):.2f} MB)...")
+        
+        start_time = time.time()
+        downloaded_bytes = 0
+        downloaded_count = 0
+        
+        # Initial print for cleaner output
+        sys.stdout.write(f"\rProgress: 0/{num_assets_to_download} (0.00 MB / 0.00 MB) [0.00%]")
+        sys.stdout.flush()
+
+        for asset in assets_to_download:
+            h = asset['hash']
+            p = asset['path']
+            s = asset['size']
+            u = f"https://resources.download.minecraft.net/{h[:2]}/{h}"
+            
+            if download(u, p, quiet=True): # Download only if not exists
+                downloaded_bytes += s
+            downloaded_count += 1
+            
+            elapsed_time = time.time() - start_time
+            if elapsed_time == 0: elapsed_time = 0.001 # Avoid ZeroDivisionError
+            
+            speed = downloaded_bytes / elapsed_time
+            remaining_bytes = total_bytes_to_download - downloaded_bytes
+            
+            eta = remaining_bytes / speed if speed > 0 else float('inf')
+            
+            progress_percent = (downloaded_bytes / total_bytes_to_download) * 100 if total_bytes_to_download > 0 else 0
+            
+            sys.stdout.write(
+                f"\rProgress: {downloaded_count}/{num_assets_to_download} ({downloaded_bytes / (1024*1024):.2f} MB / {total_bytes_to_download / (1024*1024):.2f} MB) "
+                f"[{progress_percent:.2f}%] Speed: {speed / (1024*1024):.2f} MB/s ETA: {eta:.0f}s"
+            )
+            sys.stdout.flush()
+        
+        sys.stdout.write("\n") # Newline after progress bar
+        print("Asset processing complete.")
+
+    # 5. Generate Configuration Script
+    config_dir = ".flashcraft/configs"
+    os.makedirs(config_dir, exist_ok=True)
+    
+    config_script_name = f"{version_id}"
+    if use_fabric:
+        config_script_name += "_fabric"
+    if config_name:
+        config_script_name += f"_{config_name}"
+    config_script_name += ".sh"
+
+    config_script_path = os.path.join(config_dir, config_script_name)
+
+    print(f"Generating configuration script: {config_script_path}...")
     cwd = os.getcwd()
     classpath = ":".join([os.path.relpath(p, cwd) for p in cp_parts])
     
@@ -132,8 +273,9 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric):
     if is_arm:
         env = "export MESA_GL_VERSION_OVERRIDE=4.5\nexport MESA_GLSL_VERSION_OVERRIDE=450\nexport vblank_mode=0"
 
-    # Create mods directory if it doesn't exist
-    os.makedirs("mods", exist_ok=True)
+    # Create mods directory if it doesn't exist (for Fabric)
+    if use_fabric:
+        os.makedirs("mods", exist_ok=True)
 
     cmd = [
         "java", f"-Xmx{ram}", f"-Xms{ram}",
@@ -152,14 +294,21 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric):
         "--versionType", "release"
     ]
     
-    with open("run.sh", "w") as f:
+    with open(config_script_path, "w") as f:
         f.write("#!/bin/bash\n" + env + "\n")
         f.write(" \\\n    ".join(cmd) + "\n")
     
-    os.chmod("run.sh", 0o755)
+    os.chmod(config_script_path, 0o755)
+
+    # Always ensure the main run.sh is created/updated
+    create_main_runner_script()
+
     print(f"\n✨ FlashCraft Setup Complete! {'(Fabric enabled)' if use_fabric else ''}")
-    print(f"📁 Put your mods into the 'mods' folder.")
-    print(f"👉 Run: ./run.sh")
+    if use_fabric:
+        print(f"📁 Put your mods into the 'mods' folder.")
+    print(f"👉 To start Minecraft, run: ./run.sh")
+    print(f"   (or './run.sh {os.path.basename(config_script_path).replace('.sh', '')}' to launch directly)")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FlashCraft: Minecraft ARM64/Fabric Setup Tool")
@@ -168,5 +317,14 @@ if __name__ == "__main__":
     parser.add_argument("--ram", default="2G")
     parser.add_argument("--fabric", action="store_true", help="Enable Fabric Loader")
     parser.add_argument("--skip-assets", action="store_true")
+    parser.add_argument("--config-name", help="Custom name for the configuration (e.g., 'cheats', 'sodium')")
     args = parser.parse_args()
-    setup_minecraft(args.version, args.user, args.ram, args.skip_assets, args.fabric)
+    
+    # Set default config_name based on --fabric flag
+    if args.config_name is None:
+        if args.fabric:
+            args.config_name = "fabric"
+        else:
+            args.config_name = "vanilla"
+
+    setup_minecraft(args.version, args.user, args.ram, args.skip_assets, args.fabric, args.config_name)
