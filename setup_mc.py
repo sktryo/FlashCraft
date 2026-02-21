@@ -1,4 +1,3 @@
-
 import json
 import os
 import sys
@@ -19,18 +18,18 @@ DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 # Number of parallel download threads (default)
 DEFAULT_MAX_DOWNLOAD_WORKERS = 8 
 
-def download_file_with_retries(url, path, quiet=True, retries=5, initial_delay=1):
+def download_file_with_retries(url, path, quiet=True, retries=5, initial_delay=1, timeout=30): # Increased timeout
     os.makedirs(os.path.dirname(path), exist_ok=True) # Ensure dir exists before any attempt
 
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={'User-Agent': DEFAULT_USER_AGENT})
-            with urllib.request.urlopen(req, timeout=10) as response, open(path, 'wb') as out_file:
+            with urllib.request.urlopen(req, timeout=timeout) as response, open(path, 'wb') as out_file:
                 shutil.copyfileobj(response, out_file)
             return True # Download successful
         except urllib.error.URLError as e:
             if not quiet:
-                sys.stderr.write(f"\n  Attempt {attempt + 1}/{retries} failed for {os.path.basename(path)}: {e}\n")
+                sys.stderr.write(f"\n  Attempt {attempt + 1}/{retries} failed for {os.path.basename(path)} (URL: {url}): {e}\n") # Added URL logging
             if attempt < retries - 1:
                 delay = initial_delay * (2 ** attempt) + random.uniform(0, 1) # Exponential backoff with jitter
                 if not quiet:
@@ -38,37 +37,35 @@ def download_file_with_retries(url, path, quiet=True, retries=5, initial_delay=1
                 time.sleep(delay)
             else: # Last attempt failed
                  if not quiet:
-                    sys.stderr.write(f"  Failed to download {os.path.basename(path)} after {retries} attempts.\n")
+                    sys.stderr.write(f"  Failed to download {os.path.basename(path)} (URL: {url}) after {retries} attempts.\n") # Added URL logging
                  return False
         except Exception as e:
             if not quiet:
-                sys.stderr.write(f"\n  Unexpected error during download of {os.path.basename(path)}: {e}\n")
+                sys.stderr.write(f"\n  Unexpected error during download of {os.path.basename(path)} (URL: {url}): {e}\n") # Added URL logging
             return False # No retry for unexpected errors
     return False # Should not be reached
 
-def download(url, path, quiet=False, retries=5, initial_delay=1):
+def download(url, path, quiet=False, retries=5, initial_delay=1, timeout=30): # Propagate timeout
     if os.path.exists(path):
         return True # File already exists, consider it successful
     
     # Use the retry logic
     if not quiet:
         sys.stderr.write(f"Downloading: {os.path.basename(path)}\n")
-    return download_file_with_retries(url, path, quiet=quiet, retries=retries, initial_delay=initial_delay)
+    return download_file_with_retries(url, path, quiet=quiet, retries=retries, initial_delay=initial_delay, timeout=timeout)
 
-def get_json(url):
+def get_json(url, timeout=30): # Propagate timeout
     req = urllib.request.Request(url, headers={'User-Agent': DEFAULT_USER_AGENT})
-    with urllib.request.urlopen(req, timeout=10) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode())
 
-# --- create_main_runner_script() function removed ---
-
 def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_name, max_workers):
-    print(f"--- FlashCraft v1.9.0: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
+    print(f"--- FlashCraft v1.9.1: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
     
     # 1. Minecraft Version Data
     print("Fetching Minecraft version manifest...")
     manifest = get_json(MANIFEST_URL)
-    version_entry = next((v for v in manifest["versions"] if v["id"] == version_id), None)
+    version_entry = next((v for v v in manifest["versions"] if v["id"] == version_id), None)
     if not version_entry:
         print(f"Error: Minecraft version {version_id} not found.")
         return
@@ -277,8 +274,6 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
         f.write(" \\\n    ".join(cmd) + "\n")
     
     os.chmod(launcher_script_name, 0o755)
-
-    # --- create_main_runner_script() call removed ---
 
     print(f"\n✨ FlashCraft Setup Complete! {'(Fabric enabled)' if use_fabric else ''}")
     if use_fabric:
