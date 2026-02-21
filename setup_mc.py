@@ -1,13 +1,22 @@
+
 import json
 import os
 import sys
-import urllib.request
+import urllib.request # Keep for get_json for now, might switch to requests fully
 import argparse
 import platform
 import shutil
 import time
 import random # For exponential backoff
 from concurrent.futures import ThreadPoolExecutor, as_completed # For parallel downloads
+
+# --- Try to import requests, if not available, print message ---
+try:
+    import requests
+except ImportError:
+    print("Warning: 'requests' library not found. Falling back to urllib.request for downloads.")
+    print("         For more robust downloads, please install it: pip install requests")
+    requests = None # Set to None if not available
 
 MANIFEST_URL = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
 FABRIC_META_URL = "https://meta.fabricmc.net/v2/versions/loader"
@@ -18,70 +27,123 @@ DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 # Number of parallel download threads (default)
 DEFAULT_MAX_DOWNLOAD_WORKERS = 8 
 
-def download_file_with_retries(url, path, quiet=True, retries=5, initial_delay=1, timeout=30): # Increased timeout
+def download_file_with_retries(url, path, quiet=True, retries=5, initial_delay=1, timeout=30):
     os.makedirs(os.path.dirname(path), exist_ok=True) # Ensure dir exists before any attempt
 
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': DEFAULT_USER_AGENT})
-            with urllib.request.urlopen(req, timeout=timeout) as response, open(path, 'wb') as out_file:
-                shutil.copyfileobj(response, out_file)
-            return True # Download successful
-        except urllib.error.URLError as e:
-            if not quiet:
-                sys.stderr.write(f"\n  Attempt {attempt + 1}/{retries} failed for {os.path.basename(path)} (URL: {url}): {e}\n") # Added URL logging
-            if attempt < retries - 1:
-                delay = initial_delay * (2 ** attempt) + random.uniform(0, 1) # Exponential backoff with jitter
-                if not quiet:
-                    sys.stderr.write(f"  Retrying in {delay:.1f} seconds...\n")
-                time.sleep(delay)
-            else: # Last attempt failed
-                 if not quiet:
-                    sys.stderr.write(f"  Failed to download {os.path.basename(path)} (URL: {url}) after {retries} attempts.\n") # Added URL logging
-                 return False
-        except Exception as e:
-            if not quiet:
-                sys.stderr.write(f"\n  Unexpected error during download of {os.path.basename(path)} (URL: {url}): {e}\n") # Added URL logging
-            return False # No retry for unexpected errors
-    return False # Should not be reached
+    if requests: # Use requests if available
+        for attempt in range(retries):
+            try:
+                headers = {'User-Agent': DEFAULT_USER_AGENT}
+                response = requests.get(url, headers=headers, stream=True, timeout=timeout)
+                response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
 
-def download(url, path, quiet=False, retries=5, initial_delay=1, timeout=30): # Propagate timeout
+                with open(path, 'wb') as out_file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        out_file.write(chunk)
+                response.close() # Close connection explicitly
+                return True
+            except requests.exceptions.RequestException as e:
+                if not quiet:
+                    sys.stderr.write(f"\n  Attempt {attempt + 1}/{retries} failed for {os.path.basename(path)} (URL: {url}): {e}\n")
+                    if "text/html" in response.headers.get('Content-Type', ''):
+                        sys.stderr.write(f"  Warning: Server returned HTML content, likely a redirect or error page.\n")
+                if attempt < retries - 1:
+                    delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
+                    if not quiet:
+                        sys.stderr.write(f"  Retrying in {delay:.1f} seconds...\n")
+                    time.sleep(delay)
+                else:
+                    if not quiet:
+                        sys.stderr.write(f"  Failed to download {os.path.basename(path)} (URL: {url}) after {retries} attempts.\n")
+                    return False
+        return False # Should not be reached
+    else: # Fallback to urllib.request
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': DEFAULT_USER_AGENT})
+                with urllib.request.urlopen(req, timeout=timeout) as response, open(path, 'wb') as out_file:
+                    shutil.copyfileobj(response, out_file)
+                return True # Download successful
+            except urllib.error.URLError as e:
+                if not quiet:
+                    sys.stderr.write(f"\n  Attempt {attempt + 1}/{retries} failed for {os.path.basename(path)} (URL: {url}): {e}\n")
+                if attempt < retries - 1:
+                    delay = initial_delay * (2 ** attempt) + random.uniform(0, 1) # Exponential backoff with jitter
+                    if not quiet:
+                        sys.stderr.write(f"  Retrying in {delay:.1f} seconds...\n")
+                    time.sleep(delay)
+                else: # Last attempt failed
+                    if not quiet:
+                        sys.stderr.write(f"  Failed to download {os.path.basename(path)} (URL: {url}) after {retries} attempts.\n")
+                    return False
+            except Exception as e:
+                if not quiet:
+                    sys.stderr.write(f"\n  Unexpected error during download of {os.path.basename(path)} (URL: {url}): {e}\n")
+                return False # No retry for unexpected errors
+        return False # Should not be reached
+
+def download(url, path, quiet=False, retries=5, initial_delay=1, timeout=30):
     if os.path.exists(path):
         return True # File already exists, consider it successful
     
-    # Use the retry logic
     if not quiet:
         sys.stderr.write(f"Downloading: {os.path.basename(path)}\n")
     return download_file_with_retries(url, path, quiet=quiet, retries=retries, initial_delay=initial_delay, timeout=timeout)
 
-def get_json(url, timeout=30): # Propagate timeout
-    req = urllib.request.Request(url, headers={'User-Agent': DEFAULT_USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode())
+def get_json(url, timeout=30):
+    if requests: # Use requests for JSON if available
+        headers = {'User-Agent': DEFAULT_USER_AGENT}
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            sys.stderr.write(f"\n  Error fetching JSON from {url}: {e}\n")
+            return None
+    else: # Fallback to urllib.request
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': DEFAULT_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                return json.loads(response.read().decode())
+        except urllib.error.URLError as e:
+            sys.stderr.write(f"\n  Error fetching JSON from {url}: {e}\n")
+            return None
 
 def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_name, max_workers):
-    print(f"--- FlashCraft v1.9.1: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
+    print(f"--- FlashCraft v1.9.2: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
     
     # 1. Minecraft Version Data
     print("Fetching Minecraft version manifest...")
     manifest = get_json(MANIFEST_URL)
-    version_entry = next((v for v v in manifest["versions"] if v["id"] == version_id), None)
+    if manifest is None:
+        print("Error: Could not fetch Minecraft version manifest. Check network connection.")
+        return
+    version_entry = next((v for v in manifest["versions"] if v["id"] == version_id), None)
     if not version_entry:
         print(f"Error: Minecraft version {version_id} not found.")
         return
     mc_v_data = get_json(version_entry["url"])
+    if mc_v_data is None:
+        print(f"Error: Could not fetch Minecraft version data for {version_id}. Check network connection.")
+        return
     
     # 2. Fabric Loader Data (if requested)
     fabric_data = None
     if use_fabric:
         print(f"Fetching Fabric Loader data for {version_id}...")
         loaders = get_json(f"{FABRIC_META_URL}/{version_id}")
+        if loaders is None:
+            print("Error: Could not fetch Fabric Loader data. Check network connection or Fabric Meta API status.")
+            return
         if not loaders:
             print(f"Error: Fabric not available for {version_id}.")
             return
         # Use latest stable loader version
         loader_version = next((l["loader"]["version"] for l in loaders if not l["loader"]["stable"]), loaders[0]["loader"]["version"])
         fabric_data = get_json(f"{FABRIC_META_URL}/{version_id}/{loader_version}/profile/json")
+        if fabric_data is None:
+            print(f"Error: Could not fetch Fabric profile data for {version_id}/{loader_version}. Check network connection or Fabric Meta API status.")
+            return
 
     # 3. Base JAR and Libraries
     version_dir = f"versions/{version_id}"
