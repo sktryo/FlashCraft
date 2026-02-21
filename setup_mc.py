@@ -1,4 +1,3 @@
-
 import json
 import os
 import sys
@@ -134,7 +133,7 @@ fi
     os.chmod("run.sh", 0o755)
 
 def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_name):
-    print(f"--- FlashCraft v1.8.0: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
+    print(f"--- FlashCraft v1.8.1: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
     
     # 1. Minecraft Version Data
     print("Fetching Minecraft version manifest...")
@@ -196,10 +195,17 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
             # ARM64 LWJGL
             if is_arm and "org.lwjgl" in lib["name"] and "natives-linux" in lib["name"]:
                 v = lib["name"].split(":")[-2]
-                n = lib["name"].split(":")[1]
-                arm_art = f"{n}-{v}-natives-linux-arm64.jar"
-                arm_url = f"https://repo1.maven.org/maven2/org/lwjgl/{n}/{v}/{arm_art}"
-                arm_path = os.path.join(lib_base, "org/lwjgl", n, v, arm_art)
+                n = lib["name"].split(":")[-1] # This should be name, not native classifier
+                # Re-parse name correctly
+                name_parts_full = lib["name"].split(":")
+                group_name = name_parts_full[0]
+                artifact_name = name_parts_full[1]
+                version_str = name_parts_full[2]
+                
+                arm_art = f"{artifact_name}-{version_str}-natives-linux-arm64.jar"
+                arm_url = f"https://repo1.maven.org/maven2/{group_name.replace('.', '/')}/{artifact_name}/{version_str}/{arm_art}"
+                arm_path = os.path.join(lib_base, group_name.replace('.', '/'), artifact_name, version_str, arm_art)
+                
                 if download(arm_url, arm_path, quiet=True): # Quiet download for libraries
                     lib_path = arm_path # Override with ARM64 version
                 else:
@@ -334,7 +340,7 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
         "--assetIndex", asset_id,
         "--uuid", "00000000-0000-0000-0000-000000000000",
         "--accessToken", "0",
-        --userType", "mojang",
+        "--userType", "mojang",
         "--versionType", "release"
     ]
     
