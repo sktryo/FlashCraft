@@ -1,4 +1,3 @@
-
 import json
 import os
 import sys
@@ -45,7 +44,7 @@ def download_file_with_retries(url, path, quiet=True, retries=5, initial_delay=1
             except requests.exceptions.RequestException as e:
                 if not quiet:
                     sys.stderr.write(f"\n  Attempt {attempt + 1}/{retries} failed for {os.path.basename(path)} (URL: {url}): {e}\n")
-                    if "text/html" in response.headers.get('Content-Type', ''):
+                    if "text/html" in str(e) or (response and "text/html" in response.headers.get('Content-Type', '')): # Check if HTML returned
                         sys.stderr.write(f"  Warning: Server returned HTML content, likely a redirect or error page.\n")
                 if attempt < retries - 1:
                     delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
@@ -110,7 +109,7 @@ def get_json(url, timeout=30):
             return None
 
 def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_name, max_workers):
-    print(f"--- FlashCraft v1.9.2: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
+    print(f"--- FlashCraft v1.9.3: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
     
     # 1. Minecraft Version Data
     print("Fetching Minecraft version manifest...")
@@ -212,7 +211,12 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
             version = name_parts[2]
             
             local_path = os.path.join(lib_base, group_path, artifact_name, version, f"{artifact_name}-{version}.jar")
-            if not download(lib["url"], local_path, quiet=True): # Quiet download for libraries
+            
+            # Construct the FULL download URL for Fabric libraries
+            # lib["url"] from Fabric Meta API is typically the base Maven URL (e.g., https://maven.fabricmc.net/)
+            download_url = f"{lib['url']}{group_path}/{artifact_name}/{version}/{artifact_name}-{version}.jar"
+            
+            if not download(download_url, local_path, quiet=True): # Use constructed URL for download
                 sys.stderr.write(f"\n  Warning: Failed to download Fabric library {lib['name']}. Setup may fail.\n")
             cp_parts.append(os.path.abspath(local_path))
 
