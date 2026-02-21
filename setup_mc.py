@@ -1,3 +1,4 @@
+
 import json
 import os
 import sys
@@ -17,7 +18,8 @@ def download(url, path, quiet=False):
     try:
         urllib.request.urlretrieve(url, path)
     except Exception as e:
-        print(f"  Error downloading {url}: {e}")
+        if not quiet:
+            print(f"  Error downloading {url}: {e}")
 
 def get_json(url):
     with urllib.request.urlopen(url) as response:
@@ -31,14 +33,18 @@ def setup_minecraft(version_id, username, ram, skip_assets):
     manifest = get_json(MANIFEST_URL)
     version_entry = next((v for v in manifest["versions"] if v["id"] == version_id), None)
     if not version_entry:
-        print(f"Error: Version {version_id} not found in manifest.")
+        print(f"Error: Version {version_id} not found.")
         return
 
     v_data = get_json(version_entry["url"])
     
-    # 2. Download Game JAR
-    client_jar_path = f"versions/{version_id}/{version_id}.jar"
-    print(f"Checking client JAR for {version_id}...")
+    # 2. Download Game JAR and JSON
+    version_dir = f"versions/{version_id}"
+    client_jar_path = f"{version_dir}/{version_id}.jar"
+    client_json_path = f"{version_dir}/{version_id}.json"
+    
+    print(f"Checking client files for {version_id}...")
+    download(version_entry["url"], client_json_path)
     download(v_data["downloads"]["client"]["url"], client_jar_path)
 
     # 3. Download Libraries
@@ -60,12 +66,15 @@ def setup_minecraft(version_id, username, ram, skip_assets):
                     if action == "allow": allow = True
         if not allow: continue
 
-        if "downloads" in lib and "artifact" in lib["downloads"]:
-            art = lib["downloads"]["artifact"]
-            path = os.path.join(lib_base, art["path"])
-            download(art["url"], path)
+        # Handle artifacts
+        lib_path = None
+        if "downloads" in lib:
+            if "artifact" in lib["downloads"]:
+                art = lib["downloads"]["artifact"]
+                lib_path = os.path.join(lib_base, art["path"])
+                download(art["url"], lib_path)
             
-            # LWJGL ARM64 Swap Logic
+            # Special logic for LWJGL natives on ARM64
             if is_arm and "org.lwjgl" in lib["name"] and "natives-linux" in lib["name"]:
                 version = lib["name"].split(":")[-2]
                 name = lib["name"].split(":")[1]
@@ -73,9 +82,11 @@ def setup_minecraft(version_id, username, ram, skip_assets):
                 arm64_url = f"https://repo1.maven.org/maven2/org/lwjgl/{name}/{version}/{arm64_art}"
                 arm64_path = os.path.join(lib_base, "org/lwjgl", name, version, arm64_art)
                 download(arm64_url, arm64_path)
-                path = arm64_path
-            
-            cp_parts.append(path)
+                if os.path.exists(arm64_path):
+                    lib_path = arm64_path
+        
+        if lib_path:
+            cp_parts.append(lib_path)
 
     # 4. Download Assets
     asset_info = v_data["assetIndex"]
@@ -87,63 +98,63 @@ def setup_minecraft(version_id, username, ram, skip_assets):
     if not skip_assets:
         with open(asset_index_path, "r") as f:
             assets = json.load(f)
-        
         objects = assets["objects"]
         total = len(objects)
-        print(f"Downloading {total} assets (this may take a while)...")
-        
+        print(f"Checking {total} assets...")
         count = 0
         for name, info in objects.items():
             hash_str = info["hash"]
-            prefix = hash_str[:2]
-            url = f"https://resources.download.minecraft.net/{prefix}/{hash_str}"
-            path = os.path.join("assets", "objects", prefix, hash_str)
-            download(url, path, quiet=True)
+            path = os.path.join("assets", "objects", hash_str[:2], hash_str)
+            if not os.path.exists(path):
+                url = f"https://resources.download.minecraft.net/{hash_str[:2]}/{hash_str}"
+                download(url, path, quiet=True)
             count += 1
-            if count % 500 == 0:
+            if count % 1000 == 0:
                 print(f" Progress: {count}/{total}")
         print("Asset processing complete.")
-    else:
-        print("Skipping asset download as requested.")
 
     # 5. Generate Launch Script
     print("Generating run.sh...")
     classpath = ":".join(cp_parts)
-    env_vars = ""
-    if is_arm:
-        env_vars = "export MESA_GL_VERSION_OVERRIDE=4.5\nexport MESA_GLSL_VERSION_OVERRIDE=450\nexport vblank_mode=0\n"
-
-    run_script = f"""#!/bin/bash
-{env_vars}
-java -Xmx{ram} -Xms{ram} \\
-    -Djava.library.path=. \\
-    -Dlwjgl.util.NoChecks=true \\
-    -cp "{classpath}" \\
-    {v_data['mainClass']} \\
-    --username {username} \\
-    --version {version_id} \\
-    --gameDir . \\
-    --assetsDir assets \\
-    --assetIndex {asset_index_id} \\
-    --uuid 00000000-0000-0000-0000-000000000000 \\
-    --accessToken 0 \\
-    --userType mojang \\
-    --versionType release
-"""
-    with open("run.sh", "w") as f:
-        f.write(run_script)
-    os.chmod("run.sh", 0o755)
     
-    print(f"\n✨ FlashCraft: Setup complete for {version_id}!")
-    print(f"🚀 User: {username} | RAM: {ram}")
-    print("👉 Run './run.sh' to start the game.")
+    # Environment variables for RPi4/ARM
+    env_setup = ""
+    if is_arm:
+        env_setup = "export MESA_GL_VERSION_OVERRIDE=4.5\nexport MESA_GLSL_VERSION_OVERRIDE=450\nexport vblank_mode=0"
+
+    # Use backslashes correctly for shell script
+    run_cmd = [
+        "java", f"-Xmx{ram}", f"-Xms{ram}",
+        "-Djava.library.path=.",
+        "-Dlwjgl.util.NoChecks=true",
+        "-cp", f"\"{classpath}\"",
+        v_data['mainClass'],
+        "--username", username,
+        "--version", version_id,
+        "--gameDir", ".",
+        "--assetsDir", "assets",
+        "--assetIndex", asset_index_id,
+        "--uuid", "00000000-0000-0000-0000-000000000000",
+        "--accessToken", "0",
+        "--userType", "mojang",
+        "--versionType", "release"
+    ]
+    
+    with open("run.sh", "w") as f:
+        f.write("#!/bin/bash\n")
+        f.write(env_setup + "\n")
+        # Join with backslash and newline for readability
+        f.write(" \\\n    ".join(run_cmd) + "\n")
+    
+    os.chmod("run.sh", 0o755)
+    print(f"\n✨ FlashCraft Setup Complete!")
+    print(f"👉 To start Minecraft {version_id}, run: ./run.sh")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FlashCraft: Minecraft ARM64 Setup Tool")
-    parser.add_argument("--version", default="1.21", help="Minecraft version (default: 1.21)")
-    parser.add_argument("--user", default="sktryo", help="Username (default: sktryo)")
-    parser.add_argument("--ram", default="2G", help="RAM allocation (default: 2G)")
-    parser.add_argument("--skip-assets", action="store_true", help="Skip downloading assets")
+    parser.add_argument("--version", default="1.21", help="Minecraft version")
+    parser.add_argument("--user", default="sktryo", help="Username")
+    parser.add_argument("--ram", default="2G", help="RAM (e.g. 2G, 4G)")
+    parser.add_argument("--skip-assets", action="store_true", help="Skip assets")
     args = parser.parse_args()
-    
     setup_minecraft(args.version, args.user, args.ram, args.skip_assets)
