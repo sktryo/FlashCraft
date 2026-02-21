@@ -1,4 +1,3 @@
-
 import json
 import os
 import sys
@@ -7,29 +6,48 @@ import argparse
 import platform
 import shutil
 import time
+import random # For exponential backoff
 
 MANIFEST_URL = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
 FABRIC_META_URL = "https://meta.fabricmc.net/v2/versions/loader"
 
-def download(url, path, quiet=False):
+# Improved User-Agent to avoid blocking
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+
+def download(url, path, quiet=False, retries=5, initial_delay=1):
     if os.path.exists(path):
         return False # File already exists, no download needed
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if not quiet:
         print(f"Downloading: {os.path.basename(path)}")
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response, open(path, 'wb') as out_file:
-            shutil.copyfileobj(response, out_file)
-        return True # Download successful
-    except Exception as e:
-        if not quiet:
-            print(f"  Error downloading {url}: {e}")
-        return False # Download failed
+
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': DEFAULT_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as response, open(path, 'wb') as out_file: # Added timeout
+                shutil.copyfileobj(response, out_file)
+            return True # Download successful
+        except urllib.error.URLError as e:
+            if not quiet:
+                print(f"  Attempt {attempt + 1}/{retries} failed for {os.path.basename(path)}: {e}")
+            if attempt < retries - 1:
+                delay = initial_delay * (2 ** attempt) + random.uniform(0, 1) # Exponential backoff with jitter
+                if not quiet:
+                    print(f"  Retrying in {delay:.1f} seconds...")
+                time.sleep(delay)
+        except Exception as e:
+            if not quiet:
+                print(f"  Unexpected error during download of {os.path.basename(path)}: {e}")
+            break # No retry for unexpected errors
+    
+    if not quiet:
+        print(f"  Failed to download {os.path.basename(path)} after {retries} attempts.")
+    return False # Download failed after all retries
 
 def get_json(url):
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req) as response:
+    req = urllib.request.Request(url, headers={'User-Agent': DEFAULT_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=10) as response: # Added timeout
         return json.loads(response.read().decode())
 
 def create_main_runner_script():
@@ -106,7 +124,7 @@ fi
     os.chmod("run.sh", 0o755)
 
 def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_name):
-    print(f"--- FlashCraft v1.6.0: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
+    print(f"--- FlashCraft v1.7.0: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
     
     # 1. Minecraft Version Data
     print("Fetching Minecraft version manifest...")
@@ -133,7 +151,9 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
     version_dir = f"versions/{version_id}"
     client_jar_path = f"{version_dir}/{version_id}.jar"
     print(f"Checking Minecraft client JAR...")
-    download(mc_v_data["downloads"]["client"]["url"], client_jar_path)
+    if not download(mc_v_data["downloads"]["client"]["url"], client_jar_path):
+        print("  Client JAR download failed. Aborting setup.")
+        return
 
     is_arm = platform.machine() == "aarch64"
     lib_base = "libraries"
@@ -159,7 +179,9 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
             if "artifact" in lib["downloads"]:
                 art = lib["downloads"]["artifact"]
                 lib_path = os.path.join(lib_base, art["path"])
-                download(art["url"], lib_path)
+                if not download(art["url"], lib_path):
+                    print(f"  Warning: Failed to download library {lib['name']}. Setup may fail.")
+                    lib_path = None # Don't add to classpath if download failed
             
             # ARM64 LWJGL
             if is_arm and "org.lwjgl" in lib["name"] and "natives-linux" in lib["name"]:
@@ -168,8 +190,10 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
                 arm_art = f"{n}-{v}-natives-linux-arm64.jar"
                 arm_url = f"https://repo1.maven.org/maven2/org/lwjgl/{n}/{v}/{arm_art}"
                 arm_path = os.path.join(lib_base, "org/lwjgl", n, v, arm_art)
-                download(arm_url, arm_path)
-                if os.path.exists(arm_path): lib_path = arm_path
+                if download(arm_url, arm_path):
+                    lib_path = arm_path # Override with ARM64 version
+                else:
+                    print(f"  Warning: Failed to download ARM64 LWJGL native {lib['name']}. Using x86_64 or setup may fail.")
         
         if lib_path:
             cp_parts.append(os.path.abspath(lib_path))
@@ -186,7 +210,8 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
             version = name_parts[2]
             
             local_path = os.path.join(lib_base, group_path, artifact_name, version, f"{artifact_name}-{version}.jar")
-            download(lib["url"], local_path)
+            if not download(lib["url"], local_path):
+                print(f"  Warning: Failed to download Fabric library {lib['name']}. Setup may fail.")
             cp_parts.append(os.path.abspath(local_path))
 
     # 4. Assets
@@ -213,44 +238,48 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
         num_assets_to_download = len(assets_to_download)
         total_assets = len(objects)
 
-        print(f"Downloading {num_assets_to_download} of {total_assets} assets ({total_bytes_to_download / (1024*1024):.2f} MB)...")
-        
-        start_time = time.time()
-        downloaded_bytes = 0
-        downloaded_count = 0
-        
-        # Initial print for cleaner output
-        sys.stdout.write(f"\rProgress: 0/{num_assets_to_download} (0.00 MB / 0.00 MB) [0.00%]")
-        sys.stdout.flush()
-
-        for asset in assets_to_download:
-            h = asset['hash']
-            p = asset['path']
-            s = asset['size']
-            u = f"https://resources.download.minecraft.net/{h[:2]}/{h}"
+        if num_assets_to_download == 0:
+            print("All assets already downloaded.")
+        else:
+            print(f"Downloading {num_assets_to_download} of {total_assets} assets ({total_bytes_to_download / (1024*1024):.2f} MB)...")
             
-            if download(u, p, quiet=True): # Download only if not exists
-                downloaded_bytes += s
-            downloaded_count += 1
+            start_time = time.time()
+            downloaded_bytes = 0
+            downloaded_count = 0
             
-            elapsed_time = time.time() - start_time
-            if elapsed_time == 0: elapsed_time = 0.001 # Avoid ZeroDivisionError
-            
-            speed = downloaded_bytes / elapsed_time
-            remaining_bytes = total_bytes_to_download - downloaded_bytes
-            
-            eta = remaining_bytes / speed if speed > 0 else float('inf')
-            
-            progress_percent = (downloaded_bytes / total_bytes_to_download) * 100 if total_bytes_to_download > 0 else 0
-            
-            sys.stdout.write(
-                f"\rProgress: {downloaded_count}/{num_assets_to_download} ({downloaded_bytes / (1024*1024):.2f} MB / {total_bytes_to_download / (1024*1024):.2f} MB) "
-                f"[{progress_percent:.2f}%] Speed: {speed / (1024*1024):.2f} MB/s ETA: {eta:.0f}s"
-            )
+            # Initial print for cleaner output
+            sys.stdout.write(f"\rProgress: 0/{num_assets_to_download} (0.00 MB / {total_bytes_to_download / (1024*1024):.2f} MB) [0.00%] Speed: 0.00 MB/s ETA: --s")
             sys.stdout.flush()
-        
-        sys.stdout.write("\n") # Newline after progress bar
-        print("Asset processing complete.")
+
+            for asset in assets_to_download:
+                h = asset['hash']
+                p = asset['path']
+                s = asset['size']
+                u = f"https://resources.download.minecraft.net/{h[:2]}/{h}"
+                
+                if download(u, p, quiet=True): # Download only if not exists
+                    downloaded_bytes += s
+                downloaded_count += 1
+                
+                elapsed_time = time.time() - start_time
+                if elapsed_time == 0: elapsed_time = 0.001 # Avoid ZeroDivisionError
+                
+                speed = downloaded_bytes / elapsed_time
+                remaining_bytes = total_bytes_to_download - downloaded_bytes
+                
+                eta = remaining_bytes / speed if speed > 0 else float('inf')
+                eta_str = f"{eta:.0f}s" if eta != float('inf') else "--s"
+
+                progress_percent = (downloaded_bytes / total_bytes_to_download) * 100 if total_bytes_to_download > 0 else 0
+                
+                sys.stdout.write(
+                    f"\rProgress: {downloaded_count}/{num_assets_to_download} ({downloaded_bytes / (1024*1024):.2f} MB / {total_bytes_to_download / (1024*1024):.2f} MB) "
+                    f"[{progress_percent:.2f}%] Speed: {speed / (1024*1024):.2f} MB/s ETA: {eta_str}"
+                )
+                sys.stdout.flush()
+            
+            sys.stdout.write("\n") # Newline after progress bar
+            print("Asset processing complete.")
 
     # 5. Generate Configuration Script
     config_dir = ".flashcraft/configs"
