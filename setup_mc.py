@@ -1,3 +1,4 @@
+
 import json
 import os
 import sys
@@ -15,8 +16,8 @@ FABRIC_META_URL = "https://meta.fabricmc.net/v2/versions/loader"
 # Improved User-Agent to avoid blocking
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 
-# Number of parallel download threads
-MAX_DOWNLOAD_WORKERS = 8 # Reasonable default for RPi4 with network I/O
+# Number of parallel download threads (default)
+DEFAULT_MAX_DOWNLOAD_WORKERS = 8 
 
 def download_file_with_retries(url, path, quiet=True, retries=5, initial_delay=1):
     os.makedirs(os.path.dirname(path), exist_ok=True) # Ensure dir exists before any attempt
@@ -132,8 +133,8 @@ fi
         f.write(main_runner_content)
     os.chmod("run.sh", 0o755)
 
-def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_name):
-    print(f"--- FlashCraft v1.8.1: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
+def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_name, max_workers):
+    print(f"--- FlashCraft v1.8.2: Setting up Minecraft {version_id} {'(Fabric)' if use_fabric else ''} ---")
     
     # 1. Minecraft Version Data
     print("Fetching Minecraft version manifest...")
@@ -189,14 +190,11 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
                 art = lib["downloads"]["artifact"]
                 lib_path = os.path.join(lib_base, art["path"])
                 if not download(art["url"], lib_path, quiet=True): # Quiet download for libraries
-                    print(f"  Warning: Failed to download library {lib['name']}. Setup may fail.")
+                    sys.stderr.write(f"\n  Warning: Failed to download library {lib['name']}. Setup may fail.\n")
                     lib_path = None # Don't add to classpath if download failed
             
             # ARM64 LWJGL
             if is_arm and "org.lwjgl" in lib["name"] and "natives-linux" in lib["name"]:
-                v = lib["name"].split(":")[-2]
-                n = lib["name"].split(":")[-1] # This should be name, not native classifier
-                # Re-parse name correctly
                 name_parts_full = lib["name"].split(":")
                 group_name = name_parts_full[0]
                 artifact_name = name_parts_full[1]
@@ -209,7 +207,7 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
                 if download(arm_url, arm_path, quiet=True): # Quiet download for libraries
                     lib_path = arm_path # Override with ARM64 version
                 else:
-                    print(f"  Warning: Failed to download ARM64 LWJGL native {lib['name']}. Using x86_64 or setup may fail.")
+                    sys.stderr.write(f"\n  Warning: Failed to download ARM64 LWJGL native {lib['name']}. Using x86_64 or setup may fail.\n")
         
         if lib_path:
             cp_parts.append(os.path.abspath(lib_path))
@@ -227,7 +225,7 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
             
             local_path = os.path.join(lib_base, group_path, artifact_name, version, f"{artifact_name}-{version}.jar")
             if not download(lib["url"], local_path, quiet=True): # Quiet download for libraries
-                print(f"  Warning: Failed to download Fabric library {lib['name']}. Setup may fail.")
+                sys.stderr.write(f"\n  Warning: Failed to download Fabric library {lib['name']}. Setup may fail.\n")
             cp_parts.append(os.path.abspath(local_path))
 
     # 4. Assets
@@ -259,7 +257,7 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
         if num_assets_to_download == 0:
             print("All assets already downloaded.")
         else:
-            print(f"Downloading {num_assets_to_download} of {total_assets_in_index} assets ({total_bytes_to_download / (1024*1024):.2f} MB) using {MAX_DOWNLOAD_WORKERS} workers...")
+            print(f"Downloading {num_assets_to_download} of {total_assets_in_index} assets ({total_bytes_to_download / (1024*1024):.2f} MB) using {max_workers} workers...")
             
             start_time = time.time()
             downloaded_bytes = 0
@@ -269,7 +267,7 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
             sys.stdout.write(f"\rProgress: 0/{num_assets_to_download} (0.00 MB / {total_bytes_to_download / (1024*1024):.2f} MB) [0.00%] Speed: 0.00 MB/s ETA: --s")
             sys.stdout.flush()
 
-            with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as executor:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_asset = {executor.submit(download_file_with_retries, asset['url'], asset['path'], quiet=True): asset for asset in assets_to_download}
                 
                 for future in as_completed(future_to_asset):
@@ -278,6 +276,9 @@ def setup_minecraft(version_id, username, ram, skip_assets, use_fabric, config_n
                         success = future.result()
                         if success:
                             downloaded_bytes += asset['size']
+                        else:
+                            sys.stderr.write(f"\n  Failed to download asset: {asset['url']}\n")
+
                         downloaded_count += 1
                         
                         elapsed_time = time.time() - start_time
@@ -368,6 +369,8 @@ if __name__ == "__main__":
     parser.add_argument("--fabric", action="store_true", help="Enable Fabric Loader")
     parser.add_argument("--skip-assets", action="store_true")
     parser.add_argument("--config-name", help="Custom name for the configuration (e.g., 'cheats', 'sodium')")
+    parser.add_argument("--workers", type=int, default=DEFAULT_MAX_DOWNLOAD_WORKERS,
+                        help=f"Number of parallel download threads for assets (default: {DEFAULT_MAX_DOWNLOAD_WORKERS})")
     args = parser.parse_args()
     
     # Set default config_name based on --fabric flag
@@ -377,4 +380,4 @@ if __name__ == "__main__":
         else:
             args.config_name = "vanilla"
 
-    setup_minecraft(args.version, args.user, args.ram, args.skip_assets, args.fabric, args.config_name)
+    setup_minecraft(args.version, args.user, args.ram, args.skip_assets, args.fabric, args.config_name, args.workers)
